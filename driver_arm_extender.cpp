@@ -236,12 +236,13 @@ public:
         for (uint32_t i = 1; i < k_unMaxTrackedDeviceCount; ++i) {
             if (!poses[i].bDeviceIsConnected) continue;
 
-            ETrackedDeviceClass cls = vr::VRServerDriverHost()->GetTrackedDeviceClass(i);
-            if (cls != TrackedDeviceClass_Controller) continue;
+            vr::ETrackedPropertyError err;
+            int32_t cls = (int32_t)vr::VRProperties()->GetInt32Property(
+                vr::VRProperties()->TrackedDeviceToPropertyContainer(i),
+                vr::Prop_DeviceClass_Int32, &err);
+            if (cls != (int32_t)vr::TrackedDeviceClass_Controller) continue;
 
             // Determine hand
-            char roleBuf[64] = {};
-            vr::ETrackedPropertyError err;
             int32_t role = (int32_t)vr::VRProperties()->GetInt32Property(
                 vr::VRProperties()->TrackedDeviceToPropertyContainer(i),
                 vr::Prop_ControllerRoleHint_Int32, &err);
