@@ -1,7 +1,6 @@
 /*
  * ArmExtender SteamVR Driver
  * Biomechanically correct arm extension via shoulder-pivot scaling.
- * No windows.h dependency - uses only OpenVR and C++ stdlib.
  */
 
 #include <openvr_driver.h>
@@ -10,7 +9,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
@@ -32,6 +30,9 @@ struct Vec3 {
         return l > 1e-8 ? (*this)*(1.0/l) : Vec3{};
     }
 };
+
+template<typename T>
+static T clamp_val(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static Vec3 posFromMatrix(const vr::HmdMatrix34_t& m) {
     return {m.m[0][3], m.m[1][3], m.m[2][3]};
@@ -101,28 +102,32 @@ struct PoseSmoother {
 };
 
 // --------------------------------------------------------------------------
-// Core arm extension
+// Core arm extension — works on DriverPose_t
 // --------------------------------------------------------------------------
 
 static void extendArm(
-    const vr::TrackedDevicePose_t& hmdPose,
-    vr::TrackedDevicePose_t&       controllerPose,
-    bool                            isRightHand,
-    const ArmExtenderSettings&      settings,
-    PoseSmoother&                   smoother)
+    const vr::HmdMatrix34_t&   hmdMat,
+    bool                        hmdValid,
+    vr::DriverPose_t&           pose,
+    bool                        isRightHand,
+    const ArmExtenderSettings&  settings,
+    PoseSmoother&               smoother)
 {
-    if (!controllerPose.bPoseIsValid || !hmdPose.bPoseIsValid) {
+    if (!hmdValid || pose.poseIsValid == false) {
         smoother.reset();
         return;
     }
 
-    const vr::HmdMatrix34_t& hmdMat  = hmdPose.mDeviceToAbsoluteTracking;
-    vr::HmdMatrix34_t&       ctrlMat = controllerPose.mDeviceToAbsoluteTracking;
+    // Controller world position from DriverPose vecPosition (device-to-absolute)
+    // vecPosition is in driver space; we need to work in the same space as HMD
+    Vec3 ctrlPos{ pose.vecPosition[0], pose.vecPosition[1], pose.vecPosition[2] };
 
+    // Shoulder in world space (estimated from HMD)
     float sx = isRightHand ? settings.shoulderOffsetX : -settings.shoulderOffsetX;
     Vec3 shoulderLocal{ sx, settings.shoulderOffsetY, settings.shoulderOffsetZ };
-    Vec3 shoulderWorld = posFromMatrix(hmdMat) + rotateByMatrix(hmdMat, shoulderLocal);
-    Vec3 ctrlPos = posFromMatrix(ctrlMat);
+    Vec3 hmdPos = posFromMatrix(hmdMat);
+    Vec3 shoulderWorld = hmdPos + rotateByMatrix(hmdMat, shoulderLocal);
+
     Vec3 armVec  = ctrlPos - shoulderWorld;
     double armLen = armVec.length();
 
@@ -130,20 +135,59 @@ static void extendArm(
 
     Vec3 newCtrlPos = shoulderWorld + armVec.normalized() * (armLen * settings.extensionFactor);
 
-    float alpha = std::clamp(1.0f - settings.smoothingFactor, 0.01f, 1.0f);
+    float alpha = clamp_val(1.0f - settings.smoothingFactor, 0.01f, 1.0f);
     Vec3 finalPos = smoother.smooth(newCtrlPos, alpha);
 
-    ctrlMat.m[0][3] = static_cast<float>(finalPos.x);
-    ctrlMat.m[1][3] = static_cast<float>(finalPos.y);
-    ctrlMat.m[2][3] = static_cast<float>(finalPos.z);
+    pose.vecPosition[0] = finalPos.x;
+    pose.vecPosition[1] = finalPos.y;
+    pose.vecPosition[2] = finalPos.z;
 
-    controllerPose.vVelocity.v[0] *= settings.extensionFactor;
-    controllerPose.vVelocity.v[1] *= settings.extensionFactor;
-    controllerPose.vVelocity.v[2] *= settings.extensionFactor;
+    pose.vecVelocity[0] *= settings.extensionFactor;
+    pose.vecVelocity[1] *= settings.extensionFactor;
+    pose.vecVelocity[2] *= settings.extensionFactor;
 }
 
 // --------------------------------------------------------------------------
-// Driver
+// Tracked device wrapper — wraps a real controller and modifies its pose
+// --------------------------------------------------------------------------
+
+class CArmExtenderDevice : public vr::ITrackedDeviceServerDriver {
+public:
+    CArmExtenderDevice(uint32_t realIndex, bool isRight,
+                       ArmExtenderSettings* settings)
+        : m_realIndex(realIndex), m_isRight(isRight), m_settings(settings) {}
+
+    vr::EVRInitError Activate(uint32_t unObjectId) override {
+        m_id = unObjectId;
+        return vr::VRInitError_None;
+    }
+    void Deactivate() override { m_id = vr::k_unTrackedDeviceIndexInvalid; }
+    void EnterStandby() override {}
+    void* GetComponent(const char*) override { return nullptr; }
+    void DebugRequest(const char*, char* buf, uint32_t sz) override { if(sz) buf[0]=0; }
+
+    vr::DriverPose_t GetPose() override { return m_lastPose; }
+
+    void UpdatePose(vr::DriverPose_t pose, const vr::HmdMatrix34_t& hmdMat, bool hmdValid) {
+        extendArm(hmdMat, hmdValid, pose, m_isRight, *m_settings, m_smoother);
+        m_lastPose = pose;
+        if (m_id != vr::k_unTrackedDeviceIndexInvalid)
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(m_id, m_lastPose, sizeof(m_lastPose));
+    }
+
+    uint32_t GetRealIndex() const { return m_realIndex; }
+
+private:
+    uint32_t             m_realIndex;
+    uint32_t             m_id = vr::k_unTrackedDeviceIndexInvalid;
+    bool                 m_isRight;
+    ArmExtenderSettings* m_settings;
+    vr::DriverPose_t     m_lastPose{};
+    PoseSmoother         m_smoother;
+};
+
+// --------------------------------------------------------------------------
+// Driver provider
 // --------------------------------------------------------------------------
 
 using namespace vr;
@@ -153,7 +197,6 @@ public:
     EVRInitError Init(IVRDriverContext* pDriverContext) override {
         VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
 
-        // Load config from %APPDATA%\ArmExtender\arm_extender.cfg
         const char* appData = std::getenv("APPDATA");
         if (appData) {
             m_configPath = std::string(appData) + "\\ArmExtender\\arm_extender.cfg";
@@ -181,26 +224,67 @@ public:
     const char* const* GetInterfaceVersions() override { return k_InterfaceVersions; }
 
     void RunFrame() override {
+        // Get HMD pose
         vr::TrackedDevicePose_t poses[k_unMaxTrackedDeviceCount];
         vr::VRServerDriverHost()->GetRawTrackedDevicePoses(0.f, poses, k_unMaxTrackedDeviceCount);
 
-        const auto& hmdPose = poses[k_unTrackedDeviceIndex_Hmd];
+        const auto& hmdTracked = poses[k_unTrackedDeviceIndex_Hmd];
+        bool hmdValid = hmdTracked.bPoseIsValid;
+        const vr::HmdMatrix34_t& hmdMat = hmdTracked.mDeviceToAbsoluteTracking;
 
+        // For each tracked controller, get its pose and extend it
         for (uint32_t i = 1; i < k_unMaxTrackedDeviceCount; ++i) {
             if (!poses[i].bDeviceIsConnected) continue;
-            ETrackedDeviceClass cls = vr::VRSystem()->GetTrackedDeviceClass(i);
+
+            ETrackedDeviceClass cls = vr::VRServerDriverHost()->GetTrackedDeviceClass(i);
             if (cls != TrackedDeviceClass_Controller) continue;
 
-            ETrackedControllerRole role = vr::VRSystem()->GetControllerRoleForTrackedDeviceIndex(i);
-            bool isRight = (role == TrackedControllerRole_RightHand);
-            bool isLeft  = (role == TrackedControllerRole_LeftHand);
+            // Determine hand
+            char roleBuf[64] = {};
+            vr::ETrackedPropertyError err;
+            int32_t role = (int32_t)vr::VRProperties()->GetInt32Property(
+                vr::VRProperties()->TrackedDeviceToPropertyContainer(i),
+                vr::Prop_ControllerRoleHint_Int32, &err);
+
+            bool isRight = (role == (int32_t)TrackedControllerRole_RightHand);
+            bool isLeft  = (role == (int32_t)TrackedControllerRole_LeftHand);
             if (!isLeft && !isRight) continue;
             if (isLeft  && !m_settings.enableLeft)  continue;
             if (isRight && !m_settings.enableRight) continue;
 
+            // Build a DriverPose_t from the TrackedDevicePose_t
+            vr::DriverPose_t dpose{};
+            dpose.poseIsValid     = poses[i].bPoseIsValid;
+            dpose.deviceIsConnected = poses[i].bDeviceIsConnected;
+            dpose.result          = poses[i].eTrackingResult;
+            dpose.vecPosition[0]  = poses[i].mDeviceToAbsoluteTracking.m[0][3];
+            dpose.vecPosition[1]  = poses[i].mDeviceToAbsoluteTracking.m[1][3];
+            dpose.vecPosition[2]  = poses[i].mDeviceToAbsoluteTracking.m[2][3];
+            dpose.vecVelocity[0]  = poses[i].vVelocity.v[0];
+            dpose.vecVelocity[1]  = poses[i].vVelocity.v[1];
+            dpose.vecVelocity[2]  = poses[i].vVelocity.v[2];
+            // Copy rotation from matrix to quaternion
+            const auto& m = poses[i].mDeviceToAbsoluteTracking;
+            double trace = m.m[0][0] + m.m[1][1] + m.m[2][2];
+            double w,x,y,z2;
+            if (trace > 0) {
+                double s = 0.5/std::sqrt(trace+1.0);
+                w = 0.25/s;
+                x = (m.m[2][1]-m.m[1][2])*s;
+                y = (m.m[0][2]-m.m[2][0])*s;
+                z2= (m.m[1][0]-m.m[0][1])*s;
+            } else {
+                w=0; x=0; y=0; z2=1;
+            }
+            dpose.qRotation.w=w; dpose.qRotation.x=x;
+            dpose.qRotation.y=y; dpose.qRotation.z=z2;
+            dpose.qWorldFromDriverRotation.w=1;
+            dpose.qDriverFromHeadRotation.w=1;
+
             auto& smoother = isRight ? m_smootherRight : m_smootherLeft;
-            extendArm(hmdPose, poses[i], isRight, m_settings, smoother);
-            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(i, poses[i], sizeof(vr::TrackedDevicePose_t));
+            extendArm(hmdMat, hmdValid, dpose, isRight, m_settings, smoother);
+
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(i, dpose, sizeof(dpose));
         }
     }
 
