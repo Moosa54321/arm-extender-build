@@ -1,0 +1,32 @@
+name: Build ArmExtender DLL
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Clone OpenVR SDK
+      run: git clone https://github.com/ValveSoftware/openvr openvr
+
+    - name: Build DLL
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        cl.exe /LD /MD /O2 /EHsc ^
+          /I "openvr\headers" ^
+          "driver_arm_extender.cpp" ^
+          /Fe"driver_arm_extender.dll" ^
+          /link "openvr\lib\win64\openvr_api.lib"
+
+    - name: Upload DLL
+      uses: actions/upload-artifact@v4
+      with:
+        name: driver_arm_extender
+        path: driver_arm_extender.dll
